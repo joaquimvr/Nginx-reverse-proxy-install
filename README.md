@@ -1,6 +1,6 @@
 # Nginx Proxy Auto Install
 
-A user-friendly bash script that automates setting up Nginx reverse proxy configurations. Because life's too short to manually edit config files.
+A user friendly bash script that automates setting up Nginx reverse proxy configurations. Because life's too short to manually edit config files.
 
 ## What Problem Does This Solve?
 
@@ -13,31 +13,14 @@ This script handles the boring parts for you. It creates the bridge between your
 - **Simple Menu Interface**: No memorizing complex commands or flags  
 - **Input Validation**: It catches typos and silly mistakes so you don't have to  
 - **SSL/TLS Setup**: Automatic Let's Encrypt certificate configuration  
-- **WebSocket Support**: For real-time applications  
-- **Security Headers**: Basic protection against common vulnerabilities  
-- **Firewall Configuration**: Automatically opens necessary ports  
 - **Clean Removal**: Easily undo what you've created  
 
 ## Installation & Usage
 
 ```bash
-bash <(curl -s https://proxy.thedevjo.com)
+bash <(curl -s https://raw.githubusercontent.com/joaquimvr/Nginx-reverse-proxy-install/main/install.sh)
 ```
 Yes, it's that simple. The script will guide you through the rest.
-Prerequisites
-
-Before you begin, make sure you:
-
-  - Have a server (VPS, cloud instance, etc.)
-
-  - Own a domain name
-
-  - Have created an A record pointing your domain to your server's IP
-
-  - Have sudo privileges on the server
-
-**Pro tip**: DNS changes can take time to propagate. Set up your domain records at least a few hours before running this script to avoid SSL certificate issues.
-## How It Works
 
   - Run the installation command above
 
@@ -49,12 +32,11 @@ Before you begin, make sure you:
 
 ## Managing Configurations
 
-Changed your mind? Need to remove a proxy configuration? Just run the script again and select option 2 from the menu. It will show you all active configurations and let you clean up what you don't need.
-Troubleshooting
+Changed your mind? Need to remove a proxy configuration? Just run the script again and select option 3 from the menu. It will show you all active configurations and let you clean up what you don't need.
 
-If something goes wrong (because computers sometimes enjoy being difficult), check the log file:
-/var/log/nginx-reverse-proxy-installer.log feel free to create an issue on this github repo, happy to assist.
+If something goes wrong (because computers sometimes enjoy being difficult)
+feel free to create an issue on this github repo, happy to assist.
 
 **Important Note:**
 
-This script is provided as-is. While it's been tested and should work smoothly, always understand what a script does before running it on your server. With great power comes great responsibility, and all that
+This script is provided as-is. While it's been tested and should work smoothly, always understand what a script does before running it on your server.
