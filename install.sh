@@ -788,7 +788,7 @@ get_user_input() {
     # Get backend server details
     local port_provided=false
     while true; do
-        read -p "Enter the backend server IP address or hostname (e.g., 127.0.0.1, localhost, or node01.cyprusnode.com): " BACKEND_IP_INPUT
+        read -p "Enter the backend server IP address / domain or hostname (e.g., 127.0.0.1, localhost, or node01.domain.com): " BACKEND_IP_INPUT
         if [[ -n "$BACKEND_IP_INPUT" ]]; then
             # Check if port is included in the input (contains colon followed by numbers)
             if echo "$BACKEND_IP_INPUT" | grep -qE ':[0-9]+'; then
