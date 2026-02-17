@@ -17,6 +17,7 @@ NC='\033[0m' # No Color
 LOG_FILE="/var/log/nginx-reverse-proxy-installer.log"
 BACKUP_DIR="/var/backups/nginx-reverse-proxy"
 ERROR_COUNT=0
+DISCORD_WEBHOOK_URL=""
 
 # Initialize log file and backup directory
 init_logging() {
@@ -399,9 +400,10 @@ show_menu() {
     echo "  2. Renew Reverse Proxy"
     echo "  3. Remove Reverse Proxy"
     echo "  4. View Logs"
-    echo "  5. Exit"
+    echo "  5. Configure Notifications"
+    echo "  6. Exit"
     echo ""
-    read -p "  Select an option (1-5): " MENU_CHOICE
+    read -p "  Select an option (1-6): " MENU_CHOICE
 }
 
 # Function to calculate days until certificate expiration
@@ -451,6 +453,208 @@ calculate_days_until_expiry() {
     local diff_days=$((diff_seconds / 86400))
     
     echo "$diff_days"
+}
+
+# Write the standalone cron monitoring script and cron job file
+setup_cert_monitor() {
+    if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+        return 0
+    fi
+
+    local conf_dir="/etc/nginx-reverse-proxy"
+    local monitor_script="/usr/local/bin/nginx-proxy-cert-check"
+    local cron_file="/etc/cron.daily/nginx-proxy-cert-check"
+
+    mkdir -p "$conf_dir" 2>/dev/null || true
+
+    # Write config file
+    cat > "${conf_dir}/notifications.conf" << 'CONF_EOF'
+# Nginx Reverse Proxy - notification settings
+# Edit DISCORD_WEBHOOK_URL to change the webhook.
+# NOTIFY_DAYS: space-separated list of day thresholds for alerts.
+CONF_EOF
+
+    # Append runtime values (not inside heredoc so variables expand)
+    echo "DISCORD_WEBHOOK_URL=\"${DISCORD_WEBHOOK_URL}\"" >> "${conf_dir}/notifications.conf"
+    echo 'NOTIFY_DAYS="30 14 7 3 1"' >> "${conf_dir}/notifications.conf"
+
+    chmod 600 "${conf_dir}/notifications.conf"
+
+    # Write the standalone monitoring script
+    cat > "$monitor_script" << 'MONITOR_EOF'
+#!/bin/bash
+# nginx-proxy-cert-check - SSL expiry monitor for nginx-reverse-proxy-install
+# Managed by install.sh - do not edit the webhook URL here; edit notifications.conf instead.
+
+CONF_FILE="/etc/nginx-reverse-proxy/notifications.conf"
+LOG_FILE="/var/log/nginx-reverse-proxy-installer.log"
+
+if [[ ! -f "$CONF_FILE" ]]; then
+    exit 0
+fi
+
+# shellcheck source=/dev/null
+source "$CONF_FILE"
+
+if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+    exit 0
+fi
+
+NOTIFY_DAYS="${NOTIFY_DAYS:-30 14 7 3 1}"
+STATE_DIR="/var/lib/nginx-reverse-proxy/cert-notify"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+log_msg() {
+    local level="$1" msg="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
+}
+
+calculate_days_until_expiry() {
+    local cert_file="$1"
+    [[ ! -f "$cert_file" ]] && echo "0" && return
+    local expiry_date
+    expiry_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+    [[ -z "$expiry_date" ]] && echo "0" && return
+    local expiry_epoch
+    expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null || echo "0")
+    [[ -z "$expiry_epoch" || "$expiry_epoch" == "0" ]] && echo "0" && return
+    local current_epoch
+    current_epoch=$(date +%s)
+    echo $(( (expiry_epoch - current_epoch) / 86400 ))
+}
+
+notify_discord() {
+    local webhook_url="$1" domain="$2" days_left="$3" expiry_date="$4"
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+
+    local color title description
+    if [[ "$days_left" -le 0 ]]; then
+        color=9109504; title="SSL Certificate EXPIRED"
+        description="The SSL certificate for **${domain}** has **expired**!"
+    elif [[ "$days_left" -le 7 ]]; then
+        color=15158332; title="SSL Certificate Expiry Warning"
+        description="The SSL certificate for **${domain}** expires in **${days_left} day(s)**."
+    else
+        color=16753920; title="SSL Certificate Expiry Warning"
+        description="The SSL certificate for **${domain}** expires in **${days_left} day(s)**."
+    fi
+
+    local payload
+    payload=$(cat <<PAYLOAD_EOF
+{
+  "embeds": [{
+    "title": "${title}",
+    "description": "${description}",
+    "color": ${color},
+    "fields": [
+      {"name": "Domain", "value": "${domain}", "inline": true},
+      {"name": "Days Remaining", "value": "${days_left}", "inline": true},
+      {"name": "Expiry Date", "value": "${expiry_date}", "inline": false}
+    ],
+    "footer": {"text": "Server: ${hostname}"}
+  }]
+}
+PAYLOAD_EOF
+)
+
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "$webhook_url" 2>/dev/null)
+
+    if echo "$http_code" | grep -qE '^2'; then
+        log_msg "INFO" "Discord notification sent: $domain ($days_left days left)"
+    else
+        log_msg "WARNING" "Discord notification failed (HTTP $http_code): $domain"
+    fi
+}
+
+shopt -s nullglob
+found=0
+for cert_path in /etc/letsencrypt/live/*/fullchain.pem; do
+    found=1
+    domain=$(basename "$(dirname "$cert_path")")
+    days_left=$(calculate_days_until_expiry "$cert_path")
+    expiry_date=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2 || echo "unknown")
+
+    for threshold in $NOTIFY_DAYS; do
+        state_file="${STATE_DIR}/${domain}.notified_${threshold}"
+        if [[ "$days_left" -le "$threshold" ]]; then
+            if [[ ! -f "$state_file" ]]; then
+                notify_discord "$DISCORD_WEBHOOK_URL" "$domain" "$days_left" "$expiry_date"
+                touch "$state_file"
+            fi
+        else
+            rm -f "$state_file" 2>/dev/null || true
+        fi
+    done
+done
+shopt -u nullglob
+
+[[ "$found" -eq 0 ]] && log_msg "INFO" "cert-check: no certs found"
+MONITOR_EOF
+
+    chmod 755 "$monitor_script"
+
+    # Write cron job
+    cat > "$cron_file" << 'CRON_EOF'
+#!/bin/sh
+/usr/local/bin/nginx-proxy-cert-check
+CRON_EOF
+
+    chmod 755 "$cron_file"
+
+    print_status "success" "SSL certificate monitoring configured" "NOTIFY010"
+    print_status "info" "Config: /etc/nginx-reverse-proxy/notifications.conf" "NOTIFY011"
+    print_status "info" "Monitor script: /usr/local/bin/nginx-proxy-cert-check" "NOTIFY012"
+    print_status "info" "Cron job: /etc/cron.daily/nginx-proxy-cert-check" "NOTIFY013"
+}
+
+# Function to configure or update Discord webhook notifications post-install
+configure_notifications() {
+    echo ""
+    echo "╔════════════════════════════════════════════╗"
+    echo "║       Configure Notifications              ║"
+    echo "╚════════════════════════════════════════════╝"
+    echo ""
+
+    local conf_file="/etc/nginx-reverse-proxy/notifications.conf"
+    local current_url=""
+
+    if [[ -f "$conf_file" ]]; then
+        # shellcheck source=/dev/null
+        source "$conf_file" 2>/dev/null || true
+        current_url="$DISCORD_WEBHOOK_URL"
+        if [[ -n "$current_url" ]]; then
+            print_status "info" "Current webhook URL: ${current_url:0:50}..." "NOTIFY020"
+        fi
+    fi
+
+    while true; do
+        read -p "  Enter Discord webhook URL (leave blank to remove): " input_url
+        if [[ -z "$input_url" ]]; then
+            DISCORD_WEBHOOK_URL=""
+            break
+        elif [[ "$input_url" == https://discord.com/api/webhooks/* ]]; then
+            DISCORD_WEBHOOK_URL="$input_url"
+            break
+        else
+            print_status "error" "URL must start with https://discord.com/api/webhooks/" "NOTIFY021"
+        fi
+    done
+
+    if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+        # Remove monitoring files if URL cleared
+        rm -f "/etc/cron.daily/nginx-proxy-cert-check" 2>/dev/null || true
+        rm -f "$conf_file" 2>/dev/null || true
+        print_status "info" "Discord notifications disabled and monitoring files removed." "NOTIFY022"
+    else
+        setup_cert_monitor
+    fi
+
+    echo ""
 }
 
 # Function to renew reverse proxy certificate
@@ -901,8 +1105,32 @@ get_user_input() {
                 print_status "error" "Please enter 'yes' or 'no'. Please try again." "INPUT011"
             fi
         done
+
+        # Discord webhook notifications (optional)
+        local enable_discord=""
+        while true; do
+            read -p "Enable Discord webhook notifications for SSL expiry? (yes/no) [no]: " DISCORD_INPUT
+            enable_discord=$(validate_yes_no "$DISCORD_INPUT" "no")
+            if [[ $? -eq 0 ]]; then
+                break
+            else
+                print_status "error" "Please enter 'yes' or 'no'. Please try again." "INPUT012"
+            fi
+        done
+
+        if [[ "$enable_discord" == "yes" ]]; then
+            while true; do
+                read -p "Enter Discord webhook URL: " webhook_input
+                if [[ "$webhook_input" == https://discord.com/api/webhooks/* ]]; then
+                    DISCORD_WEBHOOK_URL="$webhook_input"
+                    break
+                else
+                    print_status "error" "URL must start with https://discord.com/api/webhooks/" "INPUT013"
+                fi
+            done
+        fi
     fi
-    
+
     echo ""
 }
 
@@ -1092,6 +1320,7 @@ obtain_ssl_certificate() {
         print_status "success" "SSL certificate obtained successfully using standalone method" "SSL007"
         systemctl start nginx >> "$LOG_FILE" 2>&1 || true
         add_https_configuration
+        setup_cert_monitor || true
         return 0
     fi
     
@@ -1108,9 +1337,10 @@ obtain_ssl_certificate() {
     if certbot --nginx --non-interactive --agree-tos \
         --email "$SSL_EMAIL" -d "$DOMAIN_NAME" >> "$LOG_FILE" 2>&1; then
         print_status "success" "SSL certificate obtained successfully using nginx method" "SSL009"
-        
+
         # Restore proxy settings if certbot modified them
         restore_proxy_settings_after_certbot "$config_backup"
+        setup_cert_monitor || true
         return 0
     else
         print_status "error" "Failed to obtain SSL certificate using both methods" "SSL010"
@@ -1735,6 +1965,10 @@ main() {
                 view_logs
                 ;;
             5)
+                configure_notifications
+                read -p "  Press Enter to continue... "
+                ;;
+            6)
                 echo ""
                 echo -e "  ${GREEN}Goodbye!${NC}"
                 echo ""
