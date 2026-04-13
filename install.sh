@@ -745,6 +745,14 @@ renew_reverse_proxy() {
     fi
 }
 
+# Never remove Pterodactyl panel/wings nginx configs (name contains "pterodactyl", any case).
+proxy_removal_excludes_pterodactyl_name() {
+    local name="$1"
+    local n
+    n=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    [[ "$n" == *pterodactyl* ]]
+}
+
 # Fills global PROXY_SITE_LIST (nginx vhosts in sites-available, excluding default)
 PROXY_SITE_LIST=()
 collect_proxy_site_names() {
@@ -756,6 +764,9 @@ collect_proxy_site_names() {
         [[ -f "$f" ]] || continue
         base=$(basename "$f")
         [[ "$base" == "default" ]] && continue
+        if proxy_removal_excludes_pterodactyl_name "$base"; then
+            continue
+        fi
         PROXY_SITE_LIST+=("$base")
     done
     shopt -u nullglob
@@ -769,6 +780,12 @@ purge_proxy_site_artifacts() {
 
     if [[ -z "$domain" ]]; then
         print_status "error" "No domain name given for removal." "REMOVE010"
+        return 1
+    fi
+
+    if proxy_removal_excludes_pterodactyl_name "$domain"; then
+        print_status "error" "Refusing to remove protected Pterodactyl-related config: $domain" "REMOVE023"
+        log_message "WARNING" "Blocked proxy removal for protected name (pterodactyl): $domain" "REMOVE024"
         return 1
     fi
 
@@ -841,6 +858,7 @@ purge_all_proxy_sites() {
 
     echo ""
     echo "  The following will be removed from nginx (and SSL + notify state where applicable):"
+    echo "  (Configs whose names contain \"pterodactyl\" are never included.)"
     for s in "${sites[@]}"; do
         echo "    - $s"
     done
