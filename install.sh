@@ -745,80 +745,198 @@ renew_reverse_proxy() {
     fi
 }
 
-# Function to remove reverse proxy
+# Fills global PROXY_SITE_LIST (nginx vhosts in sites-available, excluding default)
+PROXY_SITE_LIST=()
+collect_proxy_site_names() {
+    PROXY_SITE_LIST=()
+    [[ -d "/etc/nginx/sites-available" ]] || return 0
+    local f base
+    shopt -s nullglob
+    for f in /etc/nginx/sites-available/*; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        [[ "$base" == "default" ]] && continue
+        PROXY_SITE_LIST+=("$base")
+    done
+    shopt -u nullglob
+}
+
+# Remove nginx vhost, optional Let's Encrypt cert, and cert-monitor state for one domain.
+# delete_cert: "yes" | "no"
+purge_proxy_site_artifacts() {
+    local domain="$1"
+    local delete_cert="$2"
+
+    if [[ -z "$domain" ]]; then
+        print_status "error" "No domain name given for removal." "REMOVE010"
+        return 1
+    fi
+
+    print_status "info" "Purging records for: $domain" "REMOVE011"
+
+    # sites-enabled: symlink or regular file
+    if [[ -e "/etc/nginx/sites-enabled/$domain" ]]; then
+        rm -f "/etc/nginx/sites-enabled/$domain" 2>/dev/null || {
+            print_status "error" "Failed to remove sites-enabled entry: $domain" "REMOVE005"
+            return 1
+        }
+        print_status "info" "Removed sites-enabled entry: $domain" "REMOVE012"
+    fi
+
+    # sites-available: main config and script-created side files
+    rm -f "/etc/nginx/sites-available/$domain" 2>/dev/null || true
+    rm -f "/etc/nginx/sites-available/${domain}.tmp" 2>/dev/null || true
+    rm -f "/etc/nginx/sites-available/${domain}.pre-certbot" 2>/dev/null || true
+    rm -f "/etc/nginx/sites-available/${domain}.backup"* 2>/dev/null || true
+    if [[ ! -f "/etc/nginx/sites-available/$domain" ]]; then
+        print_status "info" "Removed sites-available files for: $domain" "REMOVE013"
+    fi
+
+    # SSL certificate + renewal hooks (only when requested)
+    if [[ "$delete_cert" == "yes" ]] && [[ -d "/etc/letsencrypt/live/$domain" ]]; then
+        if command -v certbot &> /dev/null; then
+            if certbot delete --cert-name "$domain" --non-interactive >> "$LOG_FILE" 2>&1; then
+                print_status "success" "Let's Encrypt certificate removed for: $domain" "REMOVE014"
+            else
+                print_status "warning" "Certbot could not delete certificate for $domain (see log). You may run: certbot delete --cert-name $domain" "REMOVE015"
+            fi
+        else
+            print_status "warning" "Certbot not installed; remove /etc/letsencrypt manually for $domain if needed." "REMOVE016"
+        fi
+    elif [[ "$delete_cert" == "no" ]] && [[ -d "/etc/letsencrypt/live/$domain" ]]; then
+        print_status "info" "SSL certificate on disk left in place for: $domain" "REMOVE017"
+    fi
+
+    # Discord/cert-monitor per-domain state
+    local state_dir="/var/lib/nginx-reverse-proxy/cert-notify"
+    if [[ -d "$state_dir" ]]; then
+        rm -f "${state_dir}/${domain}.notified_"* 2>/dev/null || true
+    fi
+
+    log_message "INFO" "Purged proxy artifacts for domain: $domain (delete_cert=$delete_cert)" "REMOVE018"
+    return 0
+}
+
+reload_nginx_after_removal() {
+    if nginx -t >> "$LOG_FILE" 2>&1; then
+        if systemctl reload nginx >> "$LOG_FILE" 2>&1; then
+            print_status "success" "Nginx configuration tested and reloaded." "REMOVE007"
+            return 0
+        fi
+        print_status "error" "Nginx test passed but reload failed. Try: systemctl reload nginx" "REMOVE008"
+        return 1
+    fi
+    print_status "error" "Nginx configuration test failed after removal. Check: nginx -t" "REMOVE009"
+    return 1
+}
+
+# Remove every managed proxy site (same cleanup as single purge, with certs)
+purge_all_proxy_sites() {
+    collect_proxy_site_names
+    local sites=("${PROXY_SITE_LIST[@]}")
+    if [[ ${#sites[@]} -eq 0 ]]; then
+        print_status "info" "No reverse proxy configurations to remove." "REMOVE001"
+        return 0
+    fi
+
+    echo ""
+    echo "  The following will be removed from nginx (and SSL + notify state where applicable):"
+    for s in "${sites[@]}"; do
+        echo "    - $s"
+    done
+    echo ""
+    read -p "  Type REMOVEALL (exactly) to confirm complete removal: " CONFIRM_ALL
+    if [[ "$CONFIRM_ALL" != "REMOVEALL" ]]; then
+        print_status "info" "Bulk removal cancelled." "REMOVE019"
+        return 0
+    fi
+
+    local d
+    for d in "${sites[@]}"; do
+        purge_proxy_site_artifacts "$d" "yes" || true
+    done
+
+    reload_nginx_after_removal
+}
+
+remove_one_proxy_interactive() {
+    collect_proxy_site_names
+    local sites=("${PROXY_SITE_LIST[@]}")
+    if [[ ${#sites[@]} -eq 0 ]]; then
+        print_status "info" "No reverse proxy configurations found." "REMOVE001"
+        return 0
+    fi
+
+    echo "  Available configurations:"
+    for i in "${!sites[@]}"; do
+        echo "    $((i+1)). ${sites[$i]}"
+    done
+    echo ""
+
+    read -p "  Enter the number of the configuration to remove: " REMOVE_CHOICE
+    if [[ ! "$REMOVE_CHOICE" =~ ^[0-9]+$ ]] || [ "$REMOVE_CHOICE" -lt 1 ] || [ "$REMOVE_CHOICE" -gt ${#sites[@]} ]; then
+        print_status "error" "Invalid selection." "REMOVE002"
+        return 1
+    fi
+
+    local selected_site="${sites[$((REMOVE_CHOICE-1))]}"
+    read -p "  Remove '$selected_site' from nginx? (yes/no): " CONFIRM_REMOVE
+    if ! validate_yes_no "$CONFIRM_REMOVE" "no" | grep -q "yes"; then
+        print_status "info" "Removal cancelled." "REMOVE003"
+        return 0
+    fi
+
+    local delete_cert="no"
+    if [[ -d "/etc/letsencrypt/live/$selected_site" ]]; then
+        read -p "  Also delete Let's Encrypt certificate for '$selected_site'? (yes/no) [yes]: " CERT_ANS
+        delete_cert=$(validate_yes_no "$CERT_ANS" "yes")
+        if [[ "$delete_cert" != "yes" && "$delete_cert" != "no" ]]; then
+            delete_cert="yes"
+        fi
+    fi
+
+    purge_proxy_site_artifacts "$selected_site" "$delete_cert"
+    reload_nginx_after_removal
+}
+
+# Function to remove reverse proxy (submenu: one site vs all)
 remove_reverse_proxy() {
     echo ""
     echo "╔════════════════════════════════════════════╗"
     echo "║      Remove Reverse Proxy Configuration    ║"
     echo "╚════════════════════════════════════════════╝"
     echo ""
-    
-    # Create backup before removal
+
     create_backup "pre_removal_$(date +%Y%m%d_%H%M%S)" > /dev/null 2>&1
-    
-    if [[ ! -d "/etc/nginx/sites-available" ]]; then
-        print_status "info" "No reverse proxy configurations found." "REMOVE001"
-        return 0
-    fi
-    
-    local sites=($(ls /etc/nginx/sites-available/ 2>/dev/null | grep -v "default" | grep -v "^$"))
-    if [[ ${#sites[@]} -eq 0 ]]; then
-        print_status "info" "No reverse proxy configurations found." "REMOVE001"
-        return 0
-    fi
-    
-    echo "  Available configurations:"
-    for i in "${!sites[@]}"; do
-        echo "    $((i+1)). ${sites[$i]}"
+    print_status "info" "Backup created under $BACKUP_DIR before removal." "REMOVE020"
+
+    while true; do
+        echo ""
+        echo "  1. Remove one site (nginx + optional SSL + monitor state)"
+        echo "  2. Remove ALL proxy sites (full reset for managed vhosts)"
+        echo "  0. Back to main menu"
+        echo ""
+        read -p "  Select an option (0-2): " SUB_REMOVE
+
+        case "$SUB_REMOVE" in
+            1)
+                remove_one_proxy_interactive
+                return 0
+                ;;
+            2)
+                purge_all_proxy_sites
+                return 0
+                ;;
+            0)
+                print_status "info" "Returning to main menu." "REMOVE021"
+                return 0
+                ;;
+            *)
+                print_status "error" "Invalid option. Choose 0, 1, or 2." "REMOVE022"
+                sleep 1
+                ;;
+        esac
     done
-    echo ""
-    
-    read -p "  Enter the number of the configuration to remove: " REMOVE_CHOICE
-    
-    if [[ ! "$REMOVE_CHOICE" =~ ^[0-9]+$ ]] || [ "$REMOVE_CHOICE" -lt 1 ] || [ "$REMOVE_CHOICE" -gt ${#sites[@]} ]; then
-        print_status "error" "Invalid selection." "REMOVE002"
-        return 1
-    fi
-    
-    local selected_site="${sites[$((REMOVE_CHOICE-1))]}"
-    
-    read -p "  Are you sure you want to remove '$selected_site'? (yes/no): " CONFIRM_REMOVE
-    if ! validate_yes_no "$CONFIRM_REMOVE" "no" | grep -q "yes"; then
-        print_status "info" "Removal cancelled." "REMOVE003"
-        return 0
-    fi
-    
-    print_status "info" "Removing configuration for $selected_site..." "REMOVE004"
-    
-    # Remove from sites-enabled
-    if [[ -f "/etc/nginx/sites-enabled/$selected_site" ]]; then
-        rm -f "/etc/nginx/sites-enabled/$selected_site" || {
-            print_status "error" "Failed to remove symlink" "REMOVE005"
-            return 1
-        }
-    fi
-    
-    # Remove from sites-available
-    if [[ -f "/etc/nginx/sites-available/$selected_site" ]]; then
-        rm -f "/etc/nginx/sites-available/$selected_site" || {
-            print_status "error" "Failed to remove configuration file" "REMOVE006"
-            return 1
-        }
-    fi
-    
-    # Test configuration
-    if nginx -t >> "$LOG_FILE" 2>&1; then
-        if systemctl reload nginx >> "$LOG_FILE" 2>&1; then
-            print_status "success" "Reverse proxy configuration for '$selected_site' removed successfully." "REMOVE007"
-            return 0
-        else
-            print_status "error" "Failed to reload NGINX. Configuration was removed but NGINX needs manual reload." "REMOVE008"
-            return 1
-        fi
-    else
-        print_status "error" "Configuration test failed after removal. Please check NGINX configuration manually." "REMOVE009"
-        return 1
-    fi
 }
 
 # Function to show welcome message
