@@ -745,12 +745,19 @@ renew_reverse_proxy() {
     fi
 }
 
-# Never remove Pterodactyl panel/wings nginx configs (name contains "pterodactyl", any case).
+# Never remove Pterodactyl panel/wings nginx configs.
+# This intentionally protects broad keywords to avoid catastrophic deletions.
 proxy_removal_excludes_pterodactyl_name() {
     local name="$1"
     local n
     n=$(echo "$name" | tr '[:upper:]' '[:lower:]')
-    [[ "$n" == *pterodactyl* ]]
+    [[ "$n" == *pterodactyl* ]] || \
+    [[ "$n" == *ptero* ]] || \
+    [[ "$n" == *wings* ]] || \
+    [[ "$n" == *panel* ]] || \
+    [[ "$n" == *daemon* ]] || \
+    [[ "$n" == *dashboard* ]] || \
+    [[ "$n" == *node* ]]
 }
 
 # Add a domain/record name once (skip protected/reserved names).
