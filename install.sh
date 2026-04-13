@@ -753,22 +753,68 @@ proxy_removal_excludes_pterodactyl_name() {
     [[ "$n" == *pterodactyl* ]]
 }
 
-# Fills global PROXY_SITE_LIST (nginx vhosts in sites-available, excluding default)
+# Add a domain/record name once (skip protected/reserved names).
+add_proxy_record_name() {
+    local name="$1"
+    local existing
+
+    [[ -z "$name" ]] && return 0
+    [[ "$name" == "default" ]] && return 0
+    if proxy_removal_excludes_pterodactyl_name "$name"; then
+        return 0
+    fi
+
+    for existing in "${PROXY_SITE_LIST[@]}"; do
+        [[ "$existing" == "$name" ]] && return 0
+    done
+
+    PROXY_SITE_LIST+=("$name")
+}
+
+# Fills global PROXY_SITE_LIST with all known proxy-related records:
+# - nginx sites-available
+# - nginx sites-enabled entries
+# - Let's Encrypt live directories
+# - Let's Encrypt renewal .conf files
 PROXY_SITE_LIST=()
 collect_proxy_site_names() {
     PROXY_SITE_LIST=()
-    [[ -d "/etc/nginx/sites-available" ]] || return 0
+
     local f base
     shopt -s nullglob
-    for f in /etc/nginx/sites-available/*; do
-        [[ -f "$f" ]] || continue
-        base=$(basename "$f")
-        [[ "$base" == "default" ]] && continue
-        if proxy_removal_excludes_pterodactyl_name "$base"; then
-            continue
-        fi
-        PROXY_SITE_LIST+=("$base")
-    done
+
+    if [[ -d "/etc/nginx/sites-available" ]]; then
+        for f in /etc/nginx/sites-available/*; do
+            [[ -f "$f" ]] || continue
+            base=$(basename "$f")
+            add_proxy_record_name "$base"
+        done
+    fi
+
+    if [[ -d "/etc/nginx/sites-enabled" ]]; then
+        for f in /etc/nginx/sites-enabled/*; do
+            base=$(basename "$f")
+            add_proxy_record_name "$base"
+        done
+    fi
+
+    if [[ -d "/etc/letsencrypt/live" ]]; then
+        for f in /etc/letsencrypt/live/*; do
+            [[ -d "$f" ]] || continue
+            base=$(basename "$f")
+            [[ "$base" == "README" ]] && continue
+            add_proxy_record_name "$base"
+        done
+    fi
+
+    if [[ -d "/etc/letsencrypt/renewal" ]]; then
+        for f in /etc/letsencrypt/renewal/*.conf; do
+            [[ -f "$f" ]] || continue
+            base=$(basename "$f" .conf)
+            add_proxy_record_name "$base"
+        done
+    fi
+
     shopt -u nullglob
 }
 
@@ -809,19 +855,34 @@ purge_proxy_site_artifacts() {
         print_status "info" "Removed sites-available files for: $domain" "REMOVE013"
     fi
 
-    # SSL certificate + renewal hooks (only when requested)
-    if [[ "$delete_cert" == "yes" ]] && [[ -d "/etc/letsencrypt/live/$domain" ]]; then
+    # SSL certificate + renewal records (only when requested)
+    if [[ "$delete_cert" == "yes" ]]; then
+        local cert_found=0
+        if [[ -d "/etc/letsencrypt/live/$domain" ]] || [[ -d "/etc/letsencrypt/archive/$domain" ]] || [[ -f "/etc/letsencrypt/renewal/$domain.conf" ]]; then
+            cert_found=1
+        fi
+
         if command -v certbot &> /dev/null; then
             if certbot delete --cert-name "$domain" --non-interactive >> "$LOG_FILE" 2>&1; then
                 print_status "success" "Let's Encrypt certificate removed for: $domain" "REMOVE014"
+                cert_found=1
             else
-                print_status "warning" "Certbot could not delete certificate for $domain (see log). You may run: certbot delete --cert-name $domain" "REMOVE015"
+                # Continue anyway: stale or partially removed certs are handled below.
+                print_status "warning" "Certbot could not fully delete certificate for $domain; applying manual cleanup." "REMOVE015"
             fi
         else
-            print_status "warning" "Certbot not installed; remove /etc/letsencrypt manually for $domain if needed." "REMOVE016"
+            print_status "warning" "Certbot not installed; applying manual certificate cleanup for $domain." "REMOVE016"
         fi
-    elif [[ "$delete_cert" == "no" ]] && [[ -d "/etc/letsencrypt/live/$domain" ]]; then
-        print_status "info" "SSL certificate on disk left in place for: $domain" "REMOVE017"
+
+        rm -rf "/etc/letsencrypt/live/$domain" 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/archive/$domain" 2>/dev/null || true
+        rm -f "/etc/letsencrypt/renewal/$domain.conf" 2>/dev/null || true
+
+        if [[ "$cert_found" -eq 1 ]]; then
+            print_status "info" "Removed SSL certificate records for: $domain" "REMOVE029"
+        fi
+    elif [[ "$delete_cert" == "no" ]] && ([[ -d "/etc/letsencrypt/live/$domain" ]] || [[ -f "/etc/letsencrypt/renewal/$domain.conf" ]]); then
+        print_status "info" "SSL certificate records left in place for: $domain" "REMOVE017"
     fi
 
     # Discord/cert-monitor per-domain state
@@ -885,7 +946,7 @@ remove_one_proxy_interactive() {
         return 0
     fi
 
-    echo "  Available configurations:"
+    echo "  Available records:"
     for i in "${!sites[@]}"; do
         echo "    $((i+1)). ${sites[$i]}"
     done
@@ -917,6 +978,58 @@ remove_one_proxy_interactive() {
     reload_nginx_after_removal
 }
 
+# Remove every managed proxy site except one the user chooses to keep (certs deleted for removed sites).
+remove_all_except_one_interactive() {
+    collect_proxy_site_names
+    local sites=("${PROXY_SITE_LIST[@]}")
+    if [[ ${#sites[@]} -lt 2 ]]; then
+        print_status "info" "Need at least two proxy configurations to use \"remove all except one\"." "REMOVE025"
+        return 0
+    fi
+
+    echo ""
+    echo "  Select the ONE configuration to KEEP. All others will be removed (nginx + SSL + notify state)."
+    echo "  (Names containing \"pterodactyl\" are never listed or removed.)"
+    echo ""
+    echo "  Configurations:"
+    for i in "${!sites[@]}"; do
+        echo "    $((i+1)). ${sites[$i]}"
+    done
+    echo ""
+
+    read -p "  Enter the number of the site to KEEP: " KEEP_CHOICE
+    if [[ ! "$KEEP_CHOICE" =~ ^[0-9]+$ ]] || [ "$KEEP_CHOICE" -lt 1 ] || [ "$KEEP_CHOICE" -gt ${#sites[@]} ]; then
+        print_status "error" "Invalid selection." "REMOVE026"
+        return 1
+    fi
+
+    local keep_site="${sites[$((KEEP_CHOICE-1))]}"
+    echo ""
+    echo "  Will KEEP:  $keep_site"
+    echo "  Will REMOVE:"
+    local d
+    for d in "${sites[@]}"; do
+        if [[ "$d" != "$keep_site" ]]; then
+            echo "    - $d"
+        fi
+    done
+    echo ""
+    read -p "  Type REMOVEOTHERS (exactly) to remove every site except the one you kept: " CONFIRM_EXCEPT
+    if [[ "$CONFIRM_EXCEPT" != "REMOVEOTHERS" ]]; then
+        print_status "info" "Bulk removal (except one) cancelled." "REMOVE027"
+        return 0
+    fi
+
+    for d in "${sites[@]}"; do
+        if [[ "$d" != "$keep_site" ]]; then
+            purge_proxy_site_artifacts "$d" "yes" || true
+        fi
+    done
+
+    print_status "success" "Kept only: $keep_site" "REMOVE028"
+    reload_nginx_after_removal
+}
+
 # Function to remove reverse proxy (submenu: one site vs all)
 remove_reverse_proxy() {
     echo ""
@@ -932,9 +1045,10 @@ remove_reverse_proxy() {
         echo ""
         echo "  1. Remove one site (nginx + optional SSL + monitor state)"
         echo "  2. Remove ALL proxy sites (full reset for managed vhosts)"
+        echo "  3. Remove all EXCEPT one (pick the single site to keep)"
         echo "  0. Back to main menu"
         echo ""
-        read -p "  Select an option (0-2): " SUB_REMOVE
+        read -p "  Select an option (0-3): " SUB_REMOVE
 
         case "$SUB_REMOVE" in
             1)
@@ -945,12 +1059,16 @@ remove_reverse_proxy() {
                 purge_all_proxy_sites
                 return 0
                 ;;
+            3)
+                remove_all_except_one_interactive
+                return 0
+                ;;
             0)
                 print_status "info" "Returning to main menu." "REMOVE021"
                 return 0
                 ;;
             *)
-                print_status "error" "Invalid option. Choose 0, 1, or 2." "REMOVE022"
+                print_status "error" "Invalid option. Choose 0, 1, 2, or 3." "REMOVE022"
                 sleep 1
                 ;;
         esac
